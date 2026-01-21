@@ -107,12 +107,31 @@ setup_domain_ssl() {
 configure_nginx() {
     log_info "Generating Modern Nginx Configuration..."
 
+    if [[ "$OS" == "arch" ]]; then
+        NGINX_USER="http"
+    elif [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
+        NGINX_USER="www-data"
+    else
+        NGINX_USER="nginx"
+    fi
+
+    log_info "Configuring Nginx to run as user: $NGINX_USER"
+
+    mkdir -p /var/www/html
+    chown -R $NGINX_USER:$NGINX_USER /var/www/html
+    chmod -R 755 /var/www/html
+
     mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak 2>/dev/null
 
+    mkdir -p /etc/nginx/conf.d
+
     cat > /etc/nginx/nginx.conf <<EOF
-user nginx; # Check user (sometimes www-data on debian)
+# Dynamically set user based on distro
+user $NGINX_USER;
 worker_processes auto;
 pid /run/nginx.pid;
+
+# Arch doesn't use modules-enabled usually, but we include it if it exists for Debian compat
 include /etc/nginx/modules-enabled/*.conf;
 
 events {
@@ -124,11 +143,7 @@ http {
     include       mime.types;
     default_type  application/octet-stream;
 
-    # Logging
-    access_log off; # Disable access log for privacy/performance
-    error_log /var/log/nginx/error.log warn;
-
-    # Optimization
+    # Performance
     sendfile on;
     tcp_nopush on;
     tcp_nodelay on;
@@ -136,31 +151,29 @@ http {
     types_hash_max_size 4096;
     client_max_body_size 16M;
 
-    # Gzip
-    gzip on;
-    gzip_vary on;
-    gzip_proxied any;
-    gzip_comp_level 6;
-    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+    # Security Headers (Global)
+    server_tokens off; # Hides Nginx version (Arch Way: security by obscurity is minimal, but this is standard practice)
 
-    # SSL Global Settings (Modern Mozilla Profile)
+    # Logging
+    access_log off;
+    error_log /var/log/nginx/error.log warn;
+
+    # SSL Global Settings
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off; # Let client decide is better for compatibility if protocols are restricted
+    ssl_prefer_server_ciphers off;
 
+    # Load Modular Configs (The Clean Way)
     include /etc/nginx/conf.d/*.conf;
-    include /etc/nginx/sites-enabled/*;
 }
 EOF
 
-    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-        sed -i 's/user nginx;/user www-data;/' /etc/nginx/nginx.conf
-    fi
+    rm -f /etc/nginx/conf.d/default.conf
+    rm -f /etc/nginx/sites-enabled/* 2>/dev/null
 
-    mkdir -p /etc/nginx/sites-enabled
-    mkdir -p /etc/nginx/sites-available
+    CONFIG_FILE="/etc/nginx/conf.d/${DOMAIN_NAME}.conf"
 
     if [[ "$SKIP_SSL" == "true" ]]; then
-        cat > /etc/nginx/sites-enabled/default.conf <<EOF
+        cat > $CONFIG_FILE <<EOF
 server {
     listen 80;
     server_name _;
@@ -169,16 +182,12 @@ server {
 }
 EOF
     else
-        cat > /etc/nginx/sites-enabled/${DOMAIN_NAME}.conf <<EOF
+        cat > $CONFIG_FILE <<EOF
 server {
     listen 80;
     listen [::]:80;
     server_name $DOMAIN_NAME;
-
-    # Redirect all HTTP to HTTPS
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
+    return 301 https://\$host\$request_uri;
 }
 
 server {
@@ -189,44 +198,30 @@ server {
     root /var/www/html;
     index index.html;
 
-    # --- SSL Configuration (Mozilla Intermediate) ---
     ssl_certificate /etc/letsencrypt/live/${DOMAIN_NAME}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN_NAME}/privkey.pem;
 
     ssl_session_timeout 1d;
-    ssl_session_cache shared:SSL:50m;
+    ssl_session_cache shared:SSL:10m;
     ssl_session_tickets off;
 
-    # Modern Ciphers
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
-
-    # HSTS (Strict Security)
+    # HSTS
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-Frame-Options "DENY" always;
 
-    # --- 1. Camouflage Website (Root) ---
+    # 1. Camouflage Site
     location / {
         try_files \$uri \$uri/ =404;
     }
 
-    # --- 2. VLESS WebSocket/gRPC Proxy ---
-    # In 3x-ui, set your inbound to listen on 127.0.0.1:${XRAY_INTERNAL_PORT}
-    # and Path to ${XRAY_PATH}
-
+    # 2. Xray VLESS (WebSocket)
     location ${XRAY_PATH} {
-        if (\$http_upgrade != "websocket") {
-            return 404;
-        }
-        proxy_redirect off;
+        if (\$http_upgrade != "websocket") { return 404; }
         proxy_pass http://127.0.0.1:${XRAY_INTERNAL_PORT};
-
+        proxy_redirect off;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host \$host;
-
-        # Real IP Forwarding
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
@@ -234,15 +229,12 @@ server {
 EOF
     fi
 
-    echo "<h1>Welcome to $DOMAIN_NAME</h1><p>System Operational.</p>" > /var/www/html/index.html
+    echo "<h1>System Operational</h1>" > /var/www/html/index.html
+    chown $NGINX_USER:$NGINX_USER /var/www/html/index.html
 
     log_info "Reloading Nginx..."
+    systemctl enable nginx
     systemctl restart nginx
-    if [[ $? -eq 0 ]]; then
-        log_success "Nginx configured and running."
-    else
-        log_error "Nginx failed to start. Check 'systemctl status nginx' or config syntax."
-    fi
 }
 
 
