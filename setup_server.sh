@@ -1,10 +1,5 @@
 #!/bin/bash
 
-# ==============================================================================
-# AUTOMATED VPN SERVER SETUP (Nginx + Xray/3x-ui + Fail2Ban + SSL)
-# Supported OS: Debian/Ubuntu, Rocky/Alma/CentOS, Arch Linux
-# ==============================================================================
-
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -21,7 +16,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root. Use 'sudo -i' or 'sudo ./script.sh'"
+        log_error "This script must be run as root."
         exit 1
     fi
 }
@@ -43,18 +38,16 @@ install_packages() {
 
     case $OS in
         ubuntu|debian)
-            log_info "Detected Debian/Ubuntu..."
+            export DEBIAN_FRONTEND=noninteractive
             apt-get update -y
             apt-get install -y vim nginx fail2ban certbot python3-certbot-nginx curl socat git tar
             ;;
         rocky|almalinux|centos|rhel)
-            log_info "Detected RHEL-based..."
             dnf install -y epel-release
             dnf update -y
             dnf install -y vim nginx fail2ban certbot python3-certbot-nginx curl socat git tar
             ;;
         arch)
-            log_info "Detected Arch Linux..."
             pacman -Syu --noconfirm
             pacman -S --noconfirm vim nginx fail2ban certbot certbot-nginx curl socat git
             ;;
@@ -78,13 +71,24 @@ setup_domain_ssl() {
     read -p "Domain: " DOMAIN_NAME
 
     if [[ -z "$DOMAIN_NAME" ]]; then
-        log_warn "No domain provided. Skipping SSL and HTTPS setup."
+        log_warn "No domain provided. Skipping SSL, Hostname, and HTTPS setup."
         SKIP_SSL=true
     else
         SKIP_SSL=false
 
-        log_info "Preparing Nginx for Certbot verification..."
+        log_info "Setting system hostname to $DOMAIN_NAME..."
+        if command -v hostnamectl &> /dev/null; then
+            hostnamectl set-hostname "$DOMAIN_NAME"
+        else
+            echo "$DOMAIN_NAME" > /etc/hostname
+            hostname "$DOMAIN_NAME"
+        fi
 
+        if ! grep -q "$DOMAIN_NAME" /etc/hosts; then
+            echo "127.0.0.1 $DOMAIN_NAME" >> /etc/hosts
+        fi
+
+        log_info "Preparing Nginx for Certbot verification..."
         systemctl start nginx
 
         mkdir -p /var/www/html
@@ -126,12 +130,10 @@ configure_nginx() {
     mkdir -p /etc/nginx/conf.d
 
     cat > /etc/nginx/nginx.conf <<EOF
-# Dynamically set user based on distro
 user $NGINX_USER;
 worker_processes auto;
 pid /run/nginx.pid;
 
-# Arch doesn't use modules-enabled usually, but we include it if it exists for Debian compat
 include /etc/nginx/modules-enabled/*.conf;
 
 events {
@@ -143,7 +145,6 @@ http {
     include       mime.types;
     default_type  application/octet-stream;
 
-    # Performance
     sendfile on;
     tcp_nopush on;
     tcp_nodelay on;
@@ -151,18 +152,13 @@ http {
     types_hash_max_size 4096;
     client_max_body_size 16M;
 
-    # Security Headers (Global)
-    server_tokens off; # Hides Nginx version (Arch Way: security by obscurity is minimal, but this is standard practice)
-
-    # Logging
+    server_tokens off;
     access_log off;
     error_log /var/log/nginx/error.log warn;
 
-    # SSL Global Settings
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
 
-    # Load Modular Configs (The Clean Way)
     include /etc/nginx/conf.d/*.conf;
 }
 EOF
@@ -205,15 +201,14 @@ server {
     ssl_session_cache shared:SSL:10m;
     ssl_session_tickets off;
 
-    # HSTS
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
 
-    # 1. Camouflage Site
     location / {
         try_files \$uri \$uri/ =404;
     }
 
-    # 2. Xray VLESS (WebSocket)
     location ${XRAY_PATH} {
         if (\$http_upgrade != "websocket") { return 404; }
         proxy_pass http://127.0.0.1:${XRAY_INTERNAL_PORT};
@@ -229,14 +224,13 @@ server {
 EOF
     fi
 
-    echo "<h1>System Operational</h1>" > /var/www/html/index.html
+    echo "<h1>System Operational</h1><p>Verified: $DOMAIN_NAME</p>" > /var/www/html/index.html
     chown $NGINX_USER:$NGINX_USER /var/www/html/index.html
 
     log_info "Reloading Nginx..."
     systemctl enable nginx
     systemctl restart nginx
 }
-
 
 configure_fail2ban() {
     log_info "Configuring Fail2Ban..."
@@ -254,16 +248,13 @@ mode = aggressive
 port = ssh
 EOF
 
+    systemctl enable fail2ban
     systemctl restart fail2ban
-    log_success "Fail2Ban active. Check status with: fail2ban-client status sshd"
+    log_success "Fail2Ban active."
 }
-
 
 install_3xui() {
     log_info "Installing 3x-ui Panel..."
-    log_warn "The 3x-ui installer will now run. Please follow its interactive prompts."
-    log_warn "If it asks for a port, use a random one (e.g., 2053) for the PANEL."
-
     bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
 }
 
@@ -285,15 +276,18 @@ main() {
     echo -e "${GREEN}==========================================${NC}"
 
     if [[ "$SKIP_SSL" == "false" ]]; then
-        echo -e "Your Website:     https://${DOMAIN_NAME}"
-        echo -e "VLESS Path:       ${XRAY_PATH}"
-        echo -e "VLESS Internal:   127.0.0.1:${XRAY_INTERNAL_PORT}"
-        echo -e "${YELLOW}IMPORTANT: In 3x-ui, create a VLESS inbound with:${NC}"
-        echo -e "  - Port: ${XRAY_INTERNAL_PORT}"
-        echo -e "  - Listen IP: 127.0.0.1"
-        echo -e "  - Transport: WebSocket"
-        echo -e "  - Path: ${XRAY_PATH}"
-        echo -e "  - Security: None (Nginx handles SSL)"
+        echo -e "Hostname set to:  ${GREEN}$DOMAIN_NAME${NC}"
+        echo -e "Web Camouflage:   https://${DOMAIN_NAME}"
+        echo -e "VLESS Path:       ${YELLOW}${XRAY_PATH}${NC}"
+        echo -e "VLESS Internal:   ${YELLOW}127.0.0.1:${XRAY_INTERNAL_PORT}${NC}"
+        echo -e ""
+        echo -e "${BLUE}INSTRUCTIONS FOR 3x-ui:${NC}"
+        echo -e "1. Create a new Inbound"
+        echo -e "2. Protocol: VLESS"
+        echo -e "3. Port: ${XRAY_INTERNAL_PORT}"
+        echo -e "4. Listen: 127.0.0.1"
+        echo -e "5. Transport: WebSocket -> Path: ${XRAY_PATH}"
+        echo -e "6. Security: None (Nginx handles SSL on 443)"
     fi
 }
 
